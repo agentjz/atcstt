@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "atc-asr-glue"
+version = "0.1.0"
+description = "CLI-first ATC transcription pipeline built on faster-whisper."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "faster-whisper>=1.1.0",
+  "imageio-ffmpeg>=0.5.1",
+  "orjson>=3.10.0",
+  "rich>=13.9.0",
+  "tqdm>=4.67.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3.0",
+]
+
+[project.scripts]
+atc-asr = "atc_asr.launcher:main"
+atc-asr-cli = "atc_asr.cli:main"
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = ["ref", ".git", ".venv", "outputs"]

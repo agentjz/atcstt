@@ -1,0 +1,10 @@
+# Runtime dependencies
+faster-whisper>=1.1.0
+imageio-ffmpeg>=0.5.1
+orjson>=3.10.0
+rich>=13.9.0
+tqdm>=4.67.0
+
+# Notes:
+# 1. GPU inference on Windows still requires CUDA 12 + cuDNN 9 at the OS level.
+# 2. Install this file first, then run: pip install -e .
