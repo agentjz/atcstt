@@ -20,6 +20,7 @@ from rich.text import Text
 from atc_asr.console import configure_console_for_utf8
 from atc_asr.pipeline import (
     PipelineConfig,
+    cleanup_spawned_processes,
     format_duration,
     load_whisper_model,
     run_pipeline,
@@ -31,6 +32,9 @@ OUTPUTS_ROOT = PROJECT_ROOT / "outputs"
 BATCH_FAILURE_MARKER = ".atc_asr_failed.txt"
 SCAN_PREVIEW_LIMIT = 12
 SELECTION_HELP = "all | 1,3,5-8 | only new | failed only | ext:mp3,wav | name:keyword"
+EXIT_COMMANDS = {"q", "quit", "exit"}
+LEADING_INPUT_ARTIFACTS = ("\ufeff", "\ufffe", "\u200b", "\u200e", "\u200f", "\u2060")
+MOJIBAKE_BOM_PREFIXES = ("ï»¿", "ÿþ", "þÿ")
 STARTUP_BANNER_LINES = (
     " █████╗ ████████╗ ██████╗     ███████╗████████╗████████╗",
     "██╔══██╗╚══██╔══╝██╔════╝     ██╔════╝╚══██╔══╝╚══██╔══╝",
@@ -139,6 +143,10 @@ class BatchExecutionSummary:
 
 class ExitInteractiveLauncher(Exception):
     """Raised when the interactive launcher should terminate."""
+
+
+class PromptInputClosed(Exception):
+    """Raised when prompt input is no longer available."""
 
 
 DEVICE_OPTIONS = (
@@ -290,15 +298,26 @@ class LauncherUI:
 
     def ask(self, prompt: str, *, default: str | None = None) -> str:
         if self.input_fn is None:
-            return Prompt.ask(
-                prompt,
-                console=self.console,
-                default=default,
-                show_default=default is not None,
-            )
+            try:
+                return Prompt.ask(
+                    prompt,
+                    console=self.console,
+                    default=default,
+                    show_default=default is not None,
+                )
+            except (EOFError, KeyboardInterrupt) as exc:
+                if default is not None:
+                    return default
+                raise PromptInputClosed from exc
 
         default_hint = f" [{default}]" if default is not None else ""
-        raw = self.input_fn(f"{prompt}{default_hint}: ").strip()
+        try:
+            raw_value = self.input_fn(f"{prompt}{default_hint}: ")
+        except (EOFError, KeyboardInterrupt, StopIteration) as exc:
+            if default is not None:
+                return default
+            raise PromptInputClosed from exc
+        raw = normalize_prompt_text(raw_value)
         if raw:
             return raw
         return default or ""
@@ -320,16 +339,23 @@ class LauncherUI:
 
     def confirm(self, prompt: str, *, default: bool = True) -> bool:
         if self.input_fn is None:
-            return Confirm.ask(
-                prompt,
-                console=self.console,
-                default=default,
-                show_default=True,
-            )
+            try:
+                return Confirm.ask(
+                    prompt,
+                    console=self.console,
+                    default=default,
+                    show_default=True,
+                )
+            except (EOFError, KeyboardInterrupt):
+                return default
 
         default_hint = "Y/n" if default else "y/N"
         while True:
-            raw = self.input_fn(f"{prompt} [{default_hint}]: ").strip().lower()
+            try:
+                raw_value = self.input_fn(f"{prompt} [{default_hint}]: ")
+            except (EOFError, KeyboardInterrupt, StopIteration):
+                return default
+            raw = normalize_prompt_text(raw_value).lower()
             if not raw:
                 return default
             if raw in {"y", "yes", "1"}:
@@ -595,6 +621,47 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def normalize_prompt_text(raw: object | None) -> str:
+    text = "" if raw is None else str(raw)
+    text = text.replace("\x00", "").strip()
+
+    changed = True
+    while changed and text:
+        changed = False
+        for prefix in (*LEADING_INPUT_ARTIFACTS, *MOJIBAKE_BOM_PREFIXES):
+            if text.startswith(prefix):
+                text = text[len(prefix) :].lstrip()
+                changed = True
+    return text
+
+
+def strip_wrapping_quotes(raw: str) -> str:
+    text = raw.strip()
+    while len(text) >= 2 and text[0] == text[-1] and text[0] in {'"', "'"}:
+        text = text[1:-1].strip()
+    for quote in ('"', "'"):
+        if text.startswith(quote):
+            text = text[1:].lstrip()
+        if text.endswith(quote):
+            text = text[:-1].rstrip()
+    return text
+
+
+def normalize_path_text(raw: object | None) -> str:
+    return strip_wrapping_quotes(normalize_prompt_text(raw))
+
+
+def resolve_path_value(raw: Path | str, *, field_name: str) -> Path:
+    normalized = normalize_path_text(raw)
+    if not normalized:
+        raise SystemExit(f"{field_name}不能为空。")
+    return Path(normalized).expanduser().resolve()
+
+
+def should_exit_prompt(raw: str) -> bool:
+    return normalize_path_text(raw).lower() in EXIT_COMMANDS
+
+
 def normalize_device(raw: str) -> str:
     normalized = raw.strip().lower()
     if normalized in {"1", "cuda", "gpu"}:
@@ -731,17 +798,20 @@ def resolve_input_path(
     ui: LauncherUI,
 ) -> Path:
     if input_path is not None:
-        return input_path.resolve()
+        return resolve_path_value(input_path, field_name="输入路径")
 
     ui.blank()
-    raw = ui.ask(
-        "请输入音频文件或文件夹路径，也可以把路径拖到这个窗口后回车；输入 q 退出"
-    ).strip().strip('"')
-    if raw.lower() in {"q", "quit", "exit"}:
+    try:
+        raw = ui.ask("请输入音频文件或文件夹路径，也可以把路径拖到这个窗口后回车；输入 q 退出")
+    except PromptInputClosed:
         raise ExitInteractiveLauncher
-    if not raw:
+    if should_exit_prompt(raw):
+        raise ExitInteractiveLauncher
+
+    normalized = normalize_path_text(raw)
+    if not normalized:
         raise SystemExit("未提供输入路径。")
-    return Path(raw).resolve()
+    return Path(normalized).expanduser().resolve()
 
 
 def collect_audio_files(input_path: Path) -> list[Path]:
@@ -766,10 +836,23 @@ def collect_audio_files(input_path: Path) -> list[Path]:
 
 def resolve_output_root(input_path: Path, output_dir: Path | None) -> Path:
     if output_dir is not None:
-        return output_dir.resolve()
+        return resolve_path_value(output_dir, field_name="输出目录")
     if input_path.is_dir():
         return default_batch_output_root(input_path).resolve()
     return default_output_dir(input_path).resolve()
+
+
+def prompt_output_root(input_path: Path, *, ui: LauncherUI) -> Path:
+    default_output_root = resolve_output_root(input_path, None)
+    ui.blank()
+    raw = ui.ask(
+        "请输入输出目录；直接回车使用默认值",
+        default=str(default_output_root),
+    )
+    normalized = normalize_path_text(raw)
+    if not normalized:
+        return default_output_root
+    return Path(normalized).expanduser().resolve()
 
 
 def output_dir_for_audio(audio_path: Path, input_path: Path, output_root: Path) -> Path:
@@ -1233,79 +1316,86 @@ def run_launcher(
     input_fn: Callable[[str], str] | None = None,
     pipeline_runner=None,
 ) -> None:
-    if pipeline_runner is None:
-        pipeline_runner = run_pipeline
+    try:
+        if pipeline_runner is None:
+            pipeline_runner = run_pipeline
 
-    ui = LauncherUI(no_color=args.no_color, input_fn=input_fn)
-    if args.input_path is None:
-        ui.print_startup_banner()
-    input_path = resolve_input_path(args.input_path, ui=ui)
-    if not input_path.exists():
-        raise SystemExit(f"找不到输入路径：{input_path}")
+        ui = LauncherUI(no_color=args.no_color, input_fn=input_fn)
+        interactive_prompt = args.input_path is None
+        if interactive_prompt:
+            ui.print_startup_banner()
+        input_path = resolve_input_path(args.input_path, ui=ui)
+        if not input_path.exists():
+            raise SystemExit(f"找不到输入路径：{input_path}")
 
-    output_root = resolve_output_root(input_path, args.output_dir)
-    summary = scan_input_path(
-        input_path,
-        output_root=output_root,
-        split_only=args.split_only,
-    )
-    ui.print_scan_summary(
-        summary,
-        split_only=args.split_only,
-        overwrite=args.overwrite,
-    )
+        output_root = resolve_output_root(input_path, args.output_dir)
+        if interactive_prompt and args.output_dir is None:
+            output_root = prompt_output_root(input_path, ui=ui)
 
-    selection = resolve_selection(summary, args=args, ui=ui)
-    plan = build_execution_plan(selection, args=args)
-    ui.print_selection_summary(selection, plan)
-
-    if args.dry_run:
-        ui.print_dry_run_summary(plan)
-        return
-
-    if not plan.runnable_entries:
-        ui.warning("没有需要执行的文件，流程结束。")
-        ui.print_execution_summary(
-            BatchExecutionSummary(
-                succeeded=[],
-                failed=[],
-                skipped=list(plan.skipped_entries),
-            )
+        summary = scan_input_path(
+            input_path,
+            output_root=output_root,
+            split_only=args.split_only,
         )
-        return
+        ui.print_scan_summary(
+            summary,
+            split_only=args.split_only,
+            overwrite=args.overwrite,
+        )
 
-    device = resolve_device(args.device, ui=ui)
-    model = resolve_model(args.model, device, ui=ui)
-    language = resolve_language(args.language, ui=ui)
-    compute_type = resolve_compute_type(args.compute_type, device)
+        selection = resolve_selection(summary, args=args, ui=ui)
+        plan = build_execution_plan(selection, args=args)
+        ui.print_selection_summary(selection, plan)
 
-    ui.print_execution_plan(
-        input_path=input_path,
-        output_root=output_root,
-        device=device,
-        model=model,
-        language=language,
-        compute_type=compute_type,
-        plan=plan,
-        args=args,
-    )
+        if args.dry_run:
+            ui.print_dry_run_summary(plan)
+            return
 
-    if not should_continue(input_path=input_path, plan=plan, args=args, ui=ui):
-        raise SystemExit("用户取消执行。")
+        if not plan.runnable_entries:
+            ui.warning("没有需要执行的文件，流程结束。")
+            ui.print_execution_summary(
+                BatchExecutionSummary(
+                    succeeded=[],
+                    failed=[],
+                    skipped=list(plan.skipped_entries),
+                )
+            )
+            return
 
-    execution_summary = process_audio_files(
-        selected_entries=plan.selected_entries,
-        model=model,
-        device=device,
-        compute_type=compute_type,
-        language=language,
-        args=args,
-        ui=ui,
-        pipeline_runner=pipeline_runner,
-    )
+        device = resolve_device(args.device, ui=ui)
+        model = resolve_model(args.model, device, ui=ui)
+        language = resolve_language(args.language, ui=ui)
+        compute_type = resolve_compute_type(args.compute_type, device)
 
-    if execution_summary.failed:
-        raise SystemExit(f"共有 {len(execution_summary.failed)} 个文件处理失败。")
+        ui.print_execution_plan(
+            input_path=input_path,
+            output_root=output_root,
+            device=device,
+            model=model,
+            language=language,
+            compute_type=compute_type,
+            plan=plan,
+            args=args,
+        )
+
+        if not should_continue(input_path=input_path, plan=plan, args=args, ui=ui):
+            raise SystemExit("用户取消执行。")
+
+        execution_summary = process_audio_files(
+            selected_entries=plan.selected_entries,
+            model=model,
+            device=device,
+            compute_type=compute_type,
+            language=language,
+            args=args,
+            ui=ui,
+            pipeline_runner=pipeline_runner,
+        )
+
+        if execution_summary.failed:
+            raise SystemExit(f"共有 {len(execution_summary.failed)} 个文件处理失败。")
+    finally:
+        cleanup_spawned_processes()
 
 
 def format_system_exit_message(exc: SystemExit) -> str | None:
@@ -1329,26 +1419,32 @@ def run_interactive_launcher(
 ) -> None:
     loop_ui = LauncherUI(no_color=args.no_color, input_fn=input_fn)
 
-    while True:
-        try:
-            run_launcher(args, input_fn=input_fn, pipeline_runner=pipeline_runner)
-        except ExitInteractiveLauncher:
-            loop_ui.info("已退出 ATC 转写工具。")
-            return
-        except SystemExit as exc:
-            message = format_system_exit_message(exc)
-            if message:
-                loop_ui.error(message)
-            loop_ui.info("返回初始界面，继续拖入新的文件或文件夹；输入 q 可退出。")
-        else:
-            loop_ui.success("本轮任务已完成，返回初始界面。输入 q 可退出。")
+    try:
+        while True:
+            try:
+                run_launcher(args, input_fn=input_fn, pipeline_runner=pipeline_runner)
+            except ExitInteractiveLauncher:
+                loop_ui.info("已退出 ATC 转写工具。")
+                return
+            except SystemExit as exc:
+                message = format_system_exit_message(exc)
+                if message:
+                    loop_ui.error(message)
+                loop_ui.info("返回初始界面，继续拖入新的文件或文件夹；输入 q 可退出。")
+            else:
+                loop_ui.success("本轮任务已完成，返回初始界面。输入 q 可退出。")
+    finally:
+        cleanup_spawned_processes()
 
 
 def main(argv: Sequence[str] | None = None) -> None:
     configure_console_for_utf8()
     parser = build_parser()
     args = parser.parse_args(argv)
-    if should_loop_interactively(args):
-        run_interactive_launcher(args)
-        return
-    run_launcher(args)
+    try:
+        if should_loop_interactively(args):
+            run_interactive_launcher(args)
+            return
+        run_launcher(args)
+    finally:
+        cleanup_spawned_processes()

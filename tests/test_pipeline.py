@@ -5,6 +5,7 @@ import wave
 from argparse import Namespace
 from pathlib import Path
 
+import pytest
 from huggingface_hub.errors import LocalEntryNotFoundError
 
 
@@ -13,13 +14,16 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+import atc_asr.pipeline as pipeline_module
 from atc_asr.pipeline import (
     ChunkInfo,
     PipelineConfig,
+    cleanup_spawned_processes,
     config_from_args,
     ensure_model_available,
     model_artifacts_are_complete,
     purge_invalid_model_snapshot,
+    run_command,
     run_pipeline,
     transcribe_chunk,
 )
@@ -317,3 +321,64 @@ def test_ensure_model_available_shows_download_message_on_first_download(monkeyp
     output = capsys.readouterr().out
     assert "首次下载模型: large-v3" in output
     assert "正在显示模型下载进度" in output
+
+
+def test_run_command_terminates_child_process_when_wait_is_interrupted(monkeypatch) -> None:
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.pid = 4321
+            self.returncode = None
+            self.terminated = 0
+
+        def wait(self, timeout=None):
+            if timeout is not None:
+                return self.returncode
+            raise KeyboardInterrupt
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            self.terminated += 1
+            self.returncode = -15
+
+        def kill(self):
+            self.returncode = -9
+
+    process = FakeProcess()
+    monkeypatch.setattr("atc_asr.pipeline.subprocess.Popen", lambda command: process)
+
+    with pytest.raises(KeyboardInterrupt):
+        run_command(["ffmpeg", "-version"])
+
+    assert process.terminated == 1
+    assert not pipeline_module.ACTIVE_CHILD_PROCESSES
+
+
+def test_cleanup_spawned_processes_terminates_only_tracked_children() -> None:
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.pid = 2468
+            self.returncode = None
+            self.terminated = 0
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            self.terminated += 1
+            self.returncode = 0
+
+        def kill(self):
+            self.returncode = 0
+
+    process = FakeProcess()
+    pipeline_module.track_child_process(process)
+
+    cleanup_spawned_processes()
+
+    assert process.terminated == 1
+    assert not pipeline_module.ACTIVE_CHILD_PROCESSES

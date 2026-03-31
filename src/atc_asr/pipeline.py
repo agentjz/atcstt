@@ -4,6 +4,7 @@ import argparse
 import shutil
 import subprocess
 import sys
+import threading
 import wave
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
@@ -58,6 +59,9 @@ MODEL_REQUIRED_FILES = (
     "model.bin",
     "tokenizer.json",
 )
+
+ACTIVE_CHILD_PROCESSES: set[subprocess.Popen[Any]] = set()
+ACTIVE_CHILD_PROCESSES_LOCK = threading.Lock()
 
 
 class ProgressReporter:
@@ -154,8 +158,71 @@ def write_json(path: Path, payload: Any) -> None:
     )
 
 
+def track_child_process(process: subprocess.Popen[Any]) -> None:
+    with ACTIVE_CHILD_PROCESSES_LOCK:
+        ACTIVE_CHILD_PROCESSES.add(process)
+
+
+def untrack_child_process(process: subprocess.Popen[Any]) -> None:
+    with ACTIVE_CHILD_PROCESSES_LOCK:
+        ACTIVE_CHILD_PROCESSES.discard(process)
+
+
+def terminate_child_process(process: subprocess.Popen[Any]) -> None:
+    if process.poll() is not None:
+        return
+
+    try:
+        process.terminate()
+        process.wait(timeout=5)
+        return
+    except Exception:
+        pass
+
+    if sys.platform.startswith("win"):
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
+    else:
+        try:
+            process.kill()
+        except Exception:
+            return
+
+    try:
+        process.wait(timeout=5)
+    except Exception:
+        pass
+
+
+def cleanup_spawned_processes() -> None:
+    with ACTIVE_CHILD_PROCESSES_LOCK:
+        processes = list(ACTIVE_CHILD_PROCESSES)
+
+    for process in processes:
+        terminate_child_process(process)
+        untrack_child_process(process)
+
+
 def run_command(command: list[str]) -> None:
-    subprocess.run(command, check=True)
+    process = subprocess.Popen(command)
+    track_child_process(process)
+    try:
+        return_code = process.wait()
+    except BaseException:
+        terminate_child_process(process)
+        raise
+    finally:
+        untrack_child_process(process)
+
+    if return_code:
+        raise subprocess.CalledProcessError(return_code, command)
 
 
 def resolve_ffmpeg_path(explicit_path: str | None) -> str:

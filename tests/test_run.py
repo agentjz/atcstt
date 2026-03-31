@@ -33,7 +33,7 @@ def test_main_prompts_for_input_then_device_model_and_language(
     input_audio = tmp_path / "sample.wav"
     write_wav(input_audio)
     captured: list[object] = []
-    answers = iter([str(input_audio), "2", "3", "2", "q"])
+    answers = iter([str(input_audio), "", "2", "3", "2", "q"])
 
     monkeypatch.setattr(sys, "argv", ["run.py"])
     monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
@@ -73,7 +73,7 @@ def test_main_uses_gpu_default_model_and_default_language(monkeypatch, tmp_path)
     input_audio = tmp_path / "sample.wav"
     write_wav(input_audio)
     captured: list[object] = []
-    answers = iter([str(input_audio), "", "", "", "q"])
+    answers = iter([str(input_audio), "", "", "", "", "q"])
 
     monkeypatch.setattr(sys, "argv", ["run.py"])
     monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
@@ -100,10 +100,12 @@ def test_interactive_launcher_loops_back_for_the_next_job(
     answers = iter(
         [
             str(first_audio),
+            "",
             "2",
             "1",
             "1",
             str(second_audio),
+            "",
             "2",
             "1",
             "1",
@@ -126,6 +128,67 @@ def test_interactive_launcher_loops_back_for_the_next_job(
     ]
     output = capsys.readouterr().out
     assert output.count("atc-stt") >= 2
+    assert "本轮任务已完成，返回初始界面。输入 q 可退出。" in output
+    assert "已退出 ATC 转写工具。" in output
+
+
+def test_main_accepts_custom_output_dir_in_interactive_mode(monkeypatch, tmp_path) -> None:
+    input_audio = tmp_path / "sample.wav"
+    custom_output = tmp_path / "custom output"
+    write_wav(input_audio)
+    captured: list[object] = []
+    answers = iter([str(input_audio), f'\ufeff"{custom_output}"', "", "", "", "q"])
+
+    monkeypatch.setattr(sys, "argv", ["run.py"])
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+    monkeypatch.setattr(launcher, "probe_media_duration_seconds", lambda _: 1.0)
+    monkeypatch.setattr(launcher, "run_pipeline", lambda config: captured.append(config))
+
+    run.main()
+
+    config = captured[0]
+    assert config.output_dir == custom_output.resolve()
+
+
+def test_resolve_input_path_handles_bom_and_quotes(tmp_path) -> None:
+    input_audio = tmp_path / "sample.wav"
+    write_wav(input_audio)
+    ui = launcher.LauncherUI(
+        no_color=True,
+        input_fn=lambda prompt="": f'\ufeff"{input_audio}"',
+    )
+
+    resolved = launcher.resolve_input_path(None, ui=ui)
+
+    assert resolved == input_audio.resolve()
+
+
+def test_interactive_launcher_uses_defaults_and_exits_cleanly_when_input_is_exhausted(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    input_audio = tmp_path / "sample.wav"
+    write_wav(input_audio)
+    captured: list[object] = []
+    answers = iter([str(input_audio)])
+
+    monkeypatch.setattr(launcher, "probe_media_duration_seconds", lambda _: 1.0)
+    monkeypatch.setattr(launcher, "run_pipeline", lambda config: captured.append(config))
+
+    launcher.run_interactive_launcher(
+        launcher.build_parser().parse_args([]),
+        input_fn=lambda prompt="": next(answers),
+        pipeline_runner=launcher.run_pipeline,
+    )
+
+    assert len(captured) == 1
+    config = captured[0]
+    assert config.input_audio == input_audio.resolve()
+    assert config.output_dir == (ROOT / "outputs" / input_audio.stem).resolve()
+    assert config.device == "cuda"
+    assert config.model == "large-v3"
+    assert config.language == "en"
+    assert config.compute_type == "float16"
+    output = capsys.readouterr().out
     assert "本轮任务已完成，返回初始界面。输入 q 可退出。" in output
     assert "已退出 ATC 转写工具。" in output
 
